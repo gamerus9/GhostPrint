@@ -454,56 +454,74 @@ def stop_print(ip: str) -> bool:
 _tcp_lock = threading.Lock()
 
 
-class _ProgressReader(io.BytesIO):
-    """BytesIO wrapper that calls a callback(sent, total) on each read.
-
-    The `len` attribute is required so requests can set Content-Length
-    without falling back to chunked transfer encoding (not supported by
-    the ESP8266 HTTP server).
-    """
-
-    def __init__(self, data: bytes, callback=None):
-        super().__init__(data)
-        self._cb = callback
-        self.len = len(data)   # requests uses .len to set Content-Length
-
-    def read(self, n=-1):
-        chunk = super().read(n)
-        if self._cb and chunk:
-            self._cb(self.tell(), self.len)
-        return chunk
-
-
 def upload_gcode(name: str, content: bytes,
                  progress_cb=None) -> tuple[bool, str]:
-    """Upload gcode to printer using MKS WiFi raw octet-stream protocol.
+    """Upload gcode via SHUI multipart protocol with optional progress callback.
 
-    MKS WiFi (ESP8266/SHUI) expects:
-      POST /upload?X-Filename=<name>
-      Content-Type: application/octet-stream
-      (raw bytes body, no multipart)
+    SHUI ESP8266 firmware quirks that drove this implementation:
+      - Expects multipart/form-data with field name "file"
+      - Immediately resets connections that include Accept-Encoding or
+        Connection: keep-alive headers
+      - urllib3 applies connect-timeout to the send phase, causing large
+        files to timeout; http.client with one socket timeout avoids this
+    Progress callback: progress_cb(sent_bytes, total_bytes, speed_kbs)
     """
     if not HAS_REQUESTS:
         return False, "requests не установлен"
     try:
-        url = f"{UPLOAD_URL}?X-Filename={name}"
-        headers = {
-            "Content-Type": "application/octet-stream",
-            "Connection":   "keep-alive",
-        }
-        read_timeout = max(180, len(content) // 10_240 + 120)
-        body = _ProgressReader(content, progress_cb)
-        t0   = time.monotonic()
-        r    = requests.post(url, data=body, headers=headers,
-                             timeout=(10, read_timeout))
-        elapsed   = max(time.monotonic() - t0, 0.1)
-        data      = r.json()
+        import http.client as _http
+
+        boundary = b"----SHUIFormBoundary"
+        body = (
+            b"--" + boundary + b"\r\n"
+            b'Content-Disposition: form-data; name="file"; filename="'
+            + name.encode() + b'"\r\n'
+            b"Content-Type: application/octet-stream\r\n"
+            b"\r\n"
+            + content
+            + b"\r\n--" + boundary + b"--\r\n"
+        )
+        total   = len(body)
+        timeout = max(60, total // 10_240 + 60)  # ≥10 KB/s + 60 s buffer
+
+        ip   = _CFG["printer_ip"]
+        conn = _http.HTTPConnection(ip, 80, timeout=timeout)
+        conn.putrequest("POST", "/upload", skip_accept_encoding=True)
+        conn.putheader("Content-Type",
+                       f"multipart/form-data; boundary={boundary.decode()}")
+        conn.putheader("Content-Length", str(total))
+        conn.endheaders()
+
+        t0         = time.monotonic()
+        sent       = 0
+        chunk_size = 16 * 1024           # 16 KB chunks for smooth progress
+        _win: list[tuple[float, int]] = []  # rolling 5-second speed window
+
+        for i in range(0, total, chunk_size):
+            chunk = body[i:i + chunk_size]
+            conn.send(chunk)
+            sent += len(chunk)
+            if progress_cb:
+                now = time.monotonic()
+                _win.append((now, sent))
+                while len(_win) > 1 and now - _win[0][0] > 5:
+                    _win.pop(0)
+                if len(_win) >= 2:
+                    dt = _win[-1][0] - _win[0][0]
+                    db = _win[-1][1] - _win[0][1]
+                    speed = db / (dt * 1024) if dt > 0 else 0
+                else:
+                    speed = sent / (max(now - t0, 0.1) * 1024)
+                progress_cb(sent, total, speed)
+
+        resp    = conn.getresponse()
+        data    = json.loads(resp.read().decode())
+        elapsed = max(time.monotonic() - t0, 0.1)
+
         if data.get("err", 1) == 0:
             speed_kbs = len(content) / (elapsed * 1024)
             return True, f"✓ Файл «{name}» отправлен  ({speed_kbs:.0f} КБ/с)"
         return False, f"Принтер вернул ошибку: {data}"
-    except requests.Timeout:
-        return False, "Таймаут загрузки — принтер не ответил вовремя"
     except Exception as e:
         return False, f"Ошибка: {e}"
 
@@ -822,6 +840,100 @@ class HistoryDialog(tk.Toplevel):
                 pass
             self._load_entries()
 
+# ── UploadProgressPanel ───────────────────────────────────────────────────────
+
+class UploadProgressPanel(tk.Frame):
+    """Compact upload progress strip shown while a file is being sent."""
+
+    def __init__(self, parent, **kw):
+        super().__init__(parent, bg=BG_HDR, **kw)
+
+        # Row 1 — filename (left) · speed (right)
+        row1 = tk.Frame(self, bg=BG_HDR)
+        row1.pack(fill=tk.X, padx=16, pady=(8, 3))
+
+        self._name_lbl = tk.Label(
+            row1, text="", bg=BG_HDR, fg=FG,
+            font=("Helvetica", 9, "bold"), anchor="w")
+        self._name_lbl.pack(side=tk.LEFT)
+
+        self._speed_lbl = tk.Label(
+            row1, text="", bg=BG_HDR, fg=FG2,
+            font=("Courier", 9), anchor="e")
+        self._speed_lbl.pack(side=tk.RIGHT)
+
+        # Row 2 — progress bar (Canvas for full color control)
+        row2 = tk.Frame(self, bg=BG_HDR)
+        row2.pack(fill=tk.X, padx=16, pady=(0, 3))
+
+        self._bar = tk.Canvas(row2, bg=BG_INP, height=6,
+                              highlightthickness=0, bd=0)
+        self._bar.pack(fill=tk.X)
+        self._fill_id = None
+
+        # Row 3 — bytes sent (left) · ETA (right)
+        row3 = tk.Frame(self, bg=BG_HDR)
+        row3.pack(fill=tk.X, padx=16, pady=(0, 8))
+
+        self._bytes_lbl = tk.Label(
+            row3, text="", bg=BG_HDR, fg=FG_DIM,
+            font=("Helvetica", 8), anchor="w")
+        self._bytes_lbl.pack(side=tk.LEFT)
+
+        self._eta_lbl = tk.Label(
+            row3, text="", bg=BG_HDR, fg=FG_DIM,
+            font=("Helvetica", 8), anchor="e")
+        self._eta_lbl.pack(side=tk.RIGHT)
+
+    # ------------------------------------------------------------------
+    def update_progress(self, name: str, sent: int, total: int,
+                        speed_kbs: float):
+        """Update all widgets. Must be called from the main thread."""
+        pct = sent / total if total > 0 else 0
+
+        self._name_lbl.configure(text=f"↑  {name}")
+
+        if speed_kbs >= 1:
+            self._speed_lbl.configure(text=f"{speed_kbs:.0f} КБ/с")
+
+        # Progress bar fill
+        self._bar.update_idletasks()
+        w = self._bar.winfo_width()
+        if w > 1:
+            fill_w = max(2, int(w * pct))
+            if self._fill_id is None:
+                self._fill_id = self._bar.create_rectangle(
+                    0, 0, fill_w, 6, fill=BLUE, outline="")
+            else:
+                self._bar.coords(self._fill_id, 0, 0, fill_w, 6)
+
+        # Bytes label
+        def _fmt(b: int) -> str:
+            return f"{b/(1024*1024):.1f} МБ" if b >= 1024*1024 \
+                   else f"{b//1024} КБ"
+        self._bytes_lbl.configure(
+            text=f"{_fmt(sent)} / {_fmt(total)}  •  {pct*100:.0f}%")
+
+        # ETA label
+        if sent >= total:
+            eta = "завершено"
+        elif speed_kbs > 0:
+            rem = (total - sent) / (speed_kbs * 1024)
+            eta = (f"ост. {int(rem/60)} мин {int(rem%60)} с"
+                   if rem >= 60 else f"ост. {int(rem)} с")
+        else:
+            eta = "ост. …"
+        self._eta_lbl.configure(text=eta)
+
+    def reset(self):
+        for lbl in (self._name_lbl, self._speed_lbl,
+                    self._bytes_lbl, self._eta_lbl):
+            lbl.configure(text="")
+        if self._fill_id is not None:
+            self._bar.delete(self._fill_id)
+            self._fill_id = None
+
+
 # ── TerminalPanel ─────────────────────────────────────────────────────────────
 
 class TerminalPanel(tk.Frame):
@@ -1076,6 +1188,7 @@ class App(tk.Tk):
         self._sort_var   = tk.StringVar(value="date")
         self._sort_btns: dict[str, FlatBtn] = {}
         self._terminal_visible = False
+        self._upload_visible   = False
 
         self._build_ui()
         self._refresh()
@@ -1199,6 +1312,11 @@ class App(tk.Tk):
                      bg=BG_HDR, fg=FG_DIM,
                      font=("Helvetica", 8)).pack(side=tk.RIGHT, padx=14)
 
+        # ── Upload progress panel (hidden by default) ──────────────────────────
+        self._upload_sep   = tk.Frame(self, bg=SEP, height=1)
+        self._upload_panel = UploadProgressPanel(self)
+        # Not packed — _show/_hide_upload_bar manage visibility
+
         # ── Terminal (hidden by default) ───────────────────────────────────────
         self._terminal_sep = tk.Frame(self, bg=SEP, height=1)
         self._terminal     = TerminalPanel(self, app=self)
@@ -1271,6 +1389,21 @@ class App(tk.Tk):
             self._terminal.pack(side=tk.BOTTOM, fill=tk.X)
             self._terminal_visible = True
             self._terminal.focus_entry()
+
+    def _show_upload_bar(self):
+        if self._upload_visible:
+            return
+        self._upload_panel.reset()
+        self._upload_sep.pack(side=tk.BOTTOM, fill=tk.X)
+        self._upload_panel.pack(side=tk.BOTTOM, fill=tk.X)
+        self._upload_visible = True
+
+    def _hide_upload_bar(self):
+        if not self._upload_visible:
+            return
+        self._upload_sep.pack_forget()
+        self._upload_panel.pack_forget()
+        self._upload_visible = False
 
     def _send_terminal_command(self, cmd: str):
         ts = datetime.now().strftime("%H:%M:%S")
@@ -1545,20 +1678,16 @@ class App(tk.Tk):
             content = processed.encode("utf-8")
             size_kb = len(content) / 1024
 
-            _last = [-1]  # throttle: update only when % changes
-
-            def _progress(sent, total):
-                pct = int(100 * sent / total) if total else 0
-                if pct != _last[0]:
-                    _last[0] = pct
-                    self.after(0, self._set_status,
-                               f"Отправляю «{project.name}»  "
-                               f"{size_kb:.0f} КБ  {pct}%…")
-
+            self.after(0, self._show_upload_bar)
             self.after(0, self._set_status,
                        f"Отправляю «{project.name}»  {size_kb:.0f} КБ…")
-            ok, msg = upload_gcode(project.name, content,
-                                   progress_cb=_progress)
+
+            def _progress(sent, total, speed_kbs):
+                self.after(0, self._upload_panel.update_progress,
+                           project.name, sent, total, speed_kbs)
+
+            ok, msg = upload_gcode(project.name, content, progress_cb=_progress)
+            self.after(0, self._hide_upload_bar)
             append_history({
                 "ts":      datetime.now().isoformat(timespec="seconds"),
                 "file":    project.name,
