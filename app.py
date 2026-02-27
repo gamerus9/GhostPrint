@@ -840,6 +840,76 @@ class HistoryDialog(tk.Toplevel):
                 pass
             self._load_entries()
 
+# ── PrintProgressPanel ────────────────────────────────────────────────────────
+
+class PrintProgressPanel(tk.Frame):
+    """Compact print progress strip shown while the printer is printing or paused."""
+
+    _CLR_PRINT = GREEN          # green fill when printing
+    _CLR_PAUSE = "#f97316"      # orange fill when paused
+
+    def __init__(self, parent, **kw):
+        super().__init__(parent, bg=BG_HDR, **kw)
+
+        row1 = tk.Frame(self, bg=BG_HDR)
+        row1.pack(fill=tk.X, padx=16, pady=(8, 3))
+        self._state_lbl = tk.Label(row1, text="", bg=BG_HDR, fg=FG,
+                                   font=("Helvetica", 9, "bold"), anchor="w")
+        self._state_lbl.pack(side=tk.LEFT)
+        self._pct_lbl = tk.Label(row1, text="", bg=BG_HDR, fg=FG2,
+                                 font=("Courier", 9), anchor="e")
+        self._pct_lbl.pack(side=tk.RIGHT)
+
+        row2 = tk.Frame(self, bg=BG_HDR)
+        row2.pack(fill=tk.X, padx=16, pady=(0, 8))
+        self._bar = tk.Canvas(row2, bg=BG_INP, height=6,
+                              highlightthickness=0, bd=0)
+        self._bar.pack(fill=tk.X)
+        self._fill_id = None
+
+    def update_print(self, hotend: tuple, bed: tuple,
+                     prog: tuple | None, state: str,
+                     eta_secs: float | None = None):
+        """Update all widgets. Must be called from the main thread."""
+        pct = prog[0] / prog[1] if prog and prog[1] > 0 else 0
+
+        if state == "PAUSED":
+            icon     = "⏸  Пауза"
+            fill_clr = self._CLR_PAUSE
+        else:
+            icon     = "●  Печать"
+            fill_clr = self._CLR_PRINT
+
+        t_cur, t_tgt = hotend
+        b_cur, b_tgt = bed
+        self._state_lbl.configure(
+            text=f"{icon}  ·  T:{t_cur:.0f}°/{t_tgt:.0f}°  B:{b_cur:.0f}°/{b_tgt:.0f}°")
+
+        pct_text = f"{pct * 100:.0f}%"
+        if eta_secs and eta_secs >= 60 and pct < 1.0:
+            pct_text += f"  ·  ~{eta_secs / 3600:.0f}ч" if eta_secs >= 3600 \
+                        else f"  ·  ~{int(eta_secs / 60)}м"
+        self._pct_lbl.configure(text=pct_text)
+
+        self._bar.update_idletasks()
+        w = self._bar.winfo_width()
+        if w > 1:
+            fill_w = max(2, int(w * pct)) if pct > 0 else 0
+            if self._fill_id is None:
+                self._fill_id = self._bar.create_rectangle(
+                    0, 0, fill_w, 6, fill=fill_clr, outline="")
+            else:
+                self._bar.coords(self._fill_id, 0, 0, fill_w, 6)
+                self._bar.itemconfigure(self._fill_id, fill=fill_clr)
+
+    def reset(self):
+        self._state_lbl.configure(text="")
+        self._pct_lbl.configure(text="")
+        if self._fill_id is not None:
+            self._bar.delete(self._fill_id)
+            self._fill_id = None
+
+
 # ── UploadProgressPanel ───────────────────────────────────────────────────────
 
 class UploadProgressPanel(tk.Frame):
@@ -1189,6 +1259,8 @@ class App(tk.Tk):
         self._sort_btns: dict[str, FlatBtn] = {}
         self._terminal_visible = False
         self._upload_visible   = False
+        self._print_visible    = False
+        self._print_track: list[tuple[float, int]] = []  # (monotonic, bytes_done)
 
         self._build_ui()
         self._refresh()
@@ -1312,6 +1384,11 @@ class App(tk.Tk):
                      bg=BG_HDR, fg=FG_DIM,
                      font=("Helvetica", 8)).pack(side=tk.RIGHT, padx=14)
 
+        # ── Print progress panel (hidden by default) ───────────────────────────
+        self._print_sep   = tk.Frame(self, bg=SEP, height=1)
+        self._print_panel = PrintProgressPanel(self)
+        # Not packed — _show/_hide_print_bar manage visibility
+
         # ── Upload progress panel (hidden by default) ──────────────────────────
         self._upload_sep   = tk.Frame(self, bg=SEP, height=1)
         self._upload_panel = UploadProgressPanel(self)
@@ -1404,6 +1481,20 @@ class App(tk.Tk):
         self._upload_sep.pack_forget()
         self._upload_panel.pack_forget()
         self._upload_visible = False
+
+    def _show_print_bar(self):
+        if self._print_visible:
+            return
+        self._print_sep.pack(side=tk.BOTTOM, fill=tk.X)
+        self._print_panel.pack(side=tk.BOTTOM, fill=tk.X)
+        self._print_visible = True
+
+    def _hide_print_bar(self):
+        if not self._print_visible:
+            return
+        self._print_sep.pack_forget()
+        self._print_panel.pack_forget()
+        self._print_visible = False
 
     def _send_terminal_command(self, cmd: str):
         ts = datetime.now().strftime("%H:%M:%S")
@@ -1546,45 +1637,44 @@ class App(tk.Tk):
         ip     = _CFG["printer_ip"]
         status = _query_printer_status(ip)      # M105 + M27 in one TCP session
         if status:
-            t_cur  = status["hotend"][0]
-            t_tgt  = status["hotend"][1]
-            b_cur  = status["bed"][0]
-            b_tgt  = status["bed"][1]
-            prog   = status["progress"]
-            
-            # Get printer state (PRINTING, PAUSED, IDLE)
-            state = get_printer_state(ip) or "IDLE"
-            
-            # Format temperature display with target
+            t_cur, t_tgt = status["hotend"]
+            b_cur, b_tgt = status["bed"]
+            prog  = status["progress"]
+
+            # Derive state: M27 bytes present → likely PRINTING; check for PAUSED too
+            state = get_printer_state(ip) or ("PRINTING" if (prog and prog[1] > 0) else "IDLE")
+
             temp_str = f"T:{t_cur:.0f}°/{t_tgt:.0f}°  B:{b_cur:.0f}°/{b_tgt:.0f}°"
-            
-            if prog and prog[1] > 0:
-                pct = int(100 * prog[0] / prog[1])
-                # Calculate remaining time estimate
-                remaining_bytes = prog[1] - prog[0]
-                speed_kbs = _CFG["upload_speed_kbs"]
-                remaining_secs = remaining_bytes / (speed_kbs * 1000)
-                remaining_mins = remaining_secs / 60
-                
-                # Format time display - only show if >= 1 minute
-                if remaining_mins >= 1:
-                    if remaining_mins >= 60:
-                        time_str = f"{remaining_mins/60:.0f}ч"
-                    else:
-                        time_str = f"{remaining_mins:.0f}м"
-                else:
-                    time_str = ""  # Don't show time if less than 1 minute
-                
-                if time_str:
-                    lbl = f"{temp_str}  ·  {pct}%  ·  ~{time_str}"
-                else:
-                    lbl = f"{temp_str}  ·  {pct}%"
-                self.after(0, self._apply_printer_status, True, lbl, state)
+
+            # ── ETA tracking (rolling window over real measured progress) ──────
+            now = time.monotonic()
+            if state == "PRINTING" and prog and prog[1] > 0:
+                self._print_track.append((now, prog[0]))
+                if len(self._print_track) > 10:   # keep ~2.5 min of history
+                    self._print_track.pop(0)
+            elif state != "PAUSED":
+                self._print_track = []             # reset when idle
+
+            eta_secs: float | None = None
+            if len(self._print_track) >= 2 and prog and prog[1] > 0:
+                dt = self._print_track[-1][0] - self._print_track[0][0]
+                db = self._print_track[-1][1] - self._print_track[0][1]
+                if dt > 0 and db > 0:
+                    remaining = prog[1] - prog[0]
+                    eta_secs  = remaining / (db / dt)
+
+            # ── Print progress panel ───────────────────────────────────────────
+            if state in ("PRINTING", "PAUSED"):
+                self.after(0, self._show_print_bar)
+                self.after(0, self._print_panel.update_print,
+                           (t_cur, t_tgt), (b_cur, b_tgt), prog, state, eta_secs)
             else:
-                # Only show temperatures when not printing
-                self.after(0, self._apply_printer_status,
-                           True, temp_str, state)
+                self.after(0, self._hide_print_bar)
+
+            self.after(0, self._apply_printer_status, True, temp_str, state)
         else:
+            self._print_track = []
+            self.after(0, self._hide_print_bar)
             self.after(0, self._apply_printer_status, False, "Offline", "IDLE")
 
         if status and self._terminal_visible:
