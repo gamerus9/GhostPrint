@@ -455,17 +455,22 @@ _tcp_lock = threading.Lock()
 
 
 class _ProgressReader(io.BytesIO):
-    """BytesIO wrapper that calls a callback(sent, total) on each read."""
+    """BytesIO wrapper that calls a callback(sent, total) on each read.
+
+    The `len` attribute is required so requests can set Content-Length
+    without falling back to chunked transfer encoding (not supported by
+    the ESP8266 HTTP server).
+    """
 
     def __init__(self, data: bytes, callback=None):
         super().__init__(data)
-        self._cb  = callback
-        self._len = len(data)
+        self._cb = callback
+        self.len = len(data)   # requests uses .len to set Content-Length
 
     def read(self, n=-1):
         chunk = super().read(n)
         if self._cb and chunk:
-            self._cb(self.tell(), self._len)
+            self._cb(self.tell(), self.len)
         return chunk
 
 
@@ -483,9 +488,8 @@ def upload_gcode(name: str, content: bytes,
     try:
         url = f"{UPLOAD_URL}?X-Filename={name}"
         headers = {
-            "Content-Type":   "application/octet-stream",
-            "Connection":     "keep-alive",
-            "Content-Length": str(len(content)),
+            "Content-Type": "application/octet-stream",
+            "Connection":   "keep-alive",
         }
         read_timeout = max(180, len(content) // 10_240 + 120)
         body = _ProgressReader(content, progress_cb)
