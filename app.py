@@ -16,6 +16,7 @@ import re
 import socket
 import subprocess
 import threading
+import time
 import tkinter as tk
 from datetime import datetime
 from pathlib import Path
@@ -453,20 +454,52 @@ def stop_print(ip: str) -> bool:
 _tcp_lock = threading.Lock()
 
 
-def upload_gcode(name: str, content: bytes) -> tuple[bool, str]:
+class _ProgressReader(io.BytesIO):
+    """BytesIO wrapper that calls a callback(sent, total) on each read."""
+
+    def __init__(self, data: bytes, callback=None):
+        super().__init__(data)
+        self._cb  = callback
+        self._len = len(data)
+
+    def read(self, n=-1):
+        chunk = super().read(n)
+        if self._cb and chunk:
+            self._cb(self.tell(), self._len)
+        return chunk
+
+
+def upload_gcode(name: str, content: bytes,
+                 progress_cb=None) -> tuple[bool, str]:
+    """Upload gcode to printer using MKS WiFi raw octet-stream protocol.
+
+    MKS WiFi (ESP8266/SHUI) expects:
+      POST /upload?X-Filename=<name>
+      Content-Type: application/octet-stream
+      (raw bytes body, no multipart)
+    """
     if not HAS_REQUESTS:
         return False, "requests не установлен"
     try:
-        files   = {"file": (name, content, "text/plain")}
-        speed   = _CFG["upload_speed_kbs"]
-        timeout = max(60, len(content) // (speed * 1000) + 60)
-        r       = requests.post(UPLOAD_URL, files=files, timeout=timeout)
-        data    = r.json()
+        url = f"{UPLOAD_URL}?X-Filename={name}"
+        headers = {
+            "Content-Type":   "application/octet-stream",
+            "Connection":     "keep-alive",
+            "Content-Length": str(len(content)),
+        }
+        read_timeout = max(180, len(content) // 10_240 + 120)
+        body = _ProgressReader(content, progress_cb)
+        t0   = time.monotonic()
+        r    = requests.post(url, data=body, headers=headers,
+                             timeout=(10, read_timeout))
+        elapsed   = max(time.monotonic() - t0, 0.1)
+        data      = r.json()
         if data.get("err", 1) == 0:
-            return True, f"✓ Файл «{name}» отправлен"
+            speed_kbs = len(content) / (elapsed * 1024)
+            return True, f"✓ Файл «{name}» отправлен  ({speed_kbs:.0f} КБ/с)"
         return False, f"Принтер вернул ошибку: {data}"
     except requests.Timeout:
-        return False, "Таймаут подключения"
+        return False, "Таймаут загрузки — принтер не ответил вовремя"
     except Exception as e:
         return False, f"Ошибка: {e}"
 
@@ -1505,14 +1538,23 @@ class App(tk.Tk):
             text = project.path.read_text(encoding="utf-8", errors="replace")
             self.after(0, self._set_status, "Обрабатываю G-code…")
             processed = process_gcode(text, cooling_secs)
-            content   = processed.encode("utf-8")
-            size_kb   = len(content) / 1024
-            speed     = _CFG["upload_speed_kbs"]
-            est_secs  = size_kb / speed
-            est_str   = f"~{est_secs/60:.0f} мин" if est_secs >= 60 else f"~{est_secs:.0f}с"
+            content = processed.encode("utf-8")
+            size_kb = len(content) / 1024
+
+            _last = [-1]  # throttle: update only when % changes
+
+            def _progress(sent, total):
+                pct = int(100 * sent / total) if total else 0
+                if pct != _last[0]:
+                    _last[0] = pct
+                    self.after(0, self._set_status,
+                               f"Отправляю «{project.name}»  "
+                               f"{size_kb:.0f} КБ  {pct}%…")
+
             self.after(0, self._set_status,
-                       f"Отправляю «{project.name}»  {size_kb:.0f} КБ  {est_str}…")
-            ok, msg = upload_gcode(project.name, content)
+                       f"Отправляю «{project.name}»  {size_kb:.0f} КБ…")
+            ok, msg = upload_gcode(project.name, content,
+                                   progress_cb=_progress)
             append_history({
                 "ts":      datetime.now().isoformat(timespec="seconds"),
                 "file":    project.name,
