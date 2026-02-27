@@ -381,7 +381,7 @@ def check_printer_online(ip: str | None = None) -> bool:
     return get_printer_temps(ip) is not None
 
 
-def _query_printer_status(ip: str, timeout: float = 10.0, retries: int = 2) -> dict | None:
+def _query_printer_status(ip: str, timeout: float = 12.0, retries: int = 2) -> dict | None:
     """Single TCP session: M105 + M27 in one connection.
 
     SHUI firmware handles only one connection at a time.  Two back-to-back
@@ -1261,6 +1261,7 @@ class App(tk.Tk):
         self._upload_visible   = False
         self._print_visible    = False
         self._print_track: list[tuple[float, int]] = []  # (monotonic, bytes_done)
+        self._poll_fail_count  = 0
 
         self._build_ui()
         self._refresh()
@@ -1637,6 +1638,7 @@ class App(tk.Tk):
         ip     = _CFG["printer_ip"]
         status = _query_printer_status(ip)      # M105 + M27 in one TCP session
         if status:
+            self._poll_fail_count = 0
             t_cur, t_tgt = status["hotend"]
             b_cur, b_tgt = status["bed"]
             prog  = status["progress"]
@@ -1673,9 +1675,11 @@ class App(tk.Tk):
 
             self.after(0, self._apply_printer_status, True, temp_str, state)
         else:
-            self._print_track = []
-            self.after(0, self._hide_print_bar)
-            self.after(0, self._apply_printer_status, False, "Offline", "IDLE")
+            self._poll_fail_count += 1
+            if self._poll_fail_count >= 2:
+                self._print_track = []
+                self.after(0, self._hide_print_bar)
+                self.after(0, self._apply_printer_status, False, "Offline", "IDLE")
 
         if status and self._terminal_visible:
             ts = datetime.now().strftime("%H:%M:%S")
