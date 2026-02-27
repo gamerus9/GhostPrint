@@ -1,88 +1,157 @@
-# SHUI/Marlin 3D Print Manager
+# GhostPrint — WiFi Print Manager for Flying Bear & Marlin Printers
 
-Десктопное приложение для управления 3D-печатью на принтерах с прошивкой **SHUI/Marlin** (Flying Bear Ghost 5 и совместимые модели).
+[![Python](https://img.shields.io/badge/python-3.11%2B-blue)](https://python.org)
+[![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Windows%20%7C%20Linux-lightgrey)]()
+[![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
-![Python](https://img.shields.io/badge/python-3.11%2B-blue)
-![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Windows%20%7C%20Linux-lightgrey)
-![License](https://img.shields.io/badge/license-MIT-green)
+**GhostPrint** is a desktop application for sending G-code files and monitoring 3D printers over WiFi.
+Designed for **Flying Bear Ghost 5 / Reborn** and any **Marlin-based printer** with **SHUI firmware** (MKS WiFi ESP8266 module).
 
-## Возможности
+![GhostPrint Screenshot](docs/screenshot.png)
 
-- **Отправка G-code по Wi-Fi** — загружает файл на принтер одним кликом; можно также сохранить обработанный G-code локально
-- **Браузер проектов** — поиск и сортировка (по дате, имени, размеру)
-- **Drag & drop** `.gcode` файлов прямо в окно приложения
-- **Превью миниатюр** — читает встроенные PNG-превью из OrcaSlicer / PrusaSlicer
-- **Статус принтера в реальном времени** — температура и прогресс печати через TCP/Marlin
-- **Управление печатью** — пауза, возобновление, остановка прямо из приложения
-- **G-code терминал** — ручная отправка команд Marlin, история команд, быстрые кнопки
-- **Охлаждение после печати** — вставляет паузу с включённым вентилятором перед `M84`
-- **История отправок** — фиксирует каждую загрузку с временной меткой и результатом
-- Совместим с любым слайсером (OrcaSlicer, Cura, PrusaSlicer, Simplify3D и др.)
+---
 
-## Требования
+## Compatible Printers & Firmware
 
+**Tested with:**
+- Flying Bear Ghost 5
+- Flying Bear Ghost 5 Reborn / Reborn 3.0
+
+**Should work with** (not tested due to lack of hardware):
+- Any printer with **MKS Robin Nano** board + **MKS WiFi ESP8266** module running **SHUI firmware**
+- Any Marlin-based printer with SHUI firmware on the WiFi module (TCP port 8080 + HTTP `/upload`)
+
+**Compatible slicers** (any slicer that exports `.gcode`):
+- OrcaSlicer
+- PrusaSlicer
+- UltiMaker Cura
+- Simplify3D
+- Any other slicer
+
+> ⚠️ **Not compatible** with Klipper/Moonraker, Duet, or OctoPrint — those use different APIs.
+
+---
+
+## Features
+
+- **One-click WiFi upload** — send `.gcode` directly to your printer; no SD card needed
+- **Real-time print progress** — live progress bar with percentage and estimated time remaining
+- **Temperature monitoring** — hotend and bed temperatures updated every 15 seconds
+- **Print controls** — pause, resume, and stop print jobs from the desktop
+- **G-code terminal** — send any Marlin command (M105, G28, M114…) and see the response
+- **Project browser** — search and sort files by date, name, or size
+- **Thumbnail preview** — displays embedded PNG previews from OrcaSlicer / PrusaSlicer
+- **Drag & drop** — drop `.gcode` files directly into the window
+- **Post-print cooling** — optionally inserts a cooling pause before `M84`
+- **Send history** — logs every upload with timestamp and result
+- **Dark UI** — easy on the eyes during long print sessions
+
+---
+
+## Installation
+
+### Requirements
 - Python 3.11+
-- [uv](https://github.com/astral-sh/uv) (рекомендуется) или pip
-- Принтер с прошивкой **SHUI/Marlin**, подключённый к той же локальной сети
+- [`uv`](https://github.com/astral-sh/uv) (recommended) or pip
+- Printer connected to the same local network
 
-> **macOS:** полная поддержка.
-> **Windows / Linux:** основной функционал работает. Пункты контекстного меню «Открыть в Finder» и «Открыть в OrcaSlicer» используют macOS-команду `open` и на других платформах не сработают.
-
-## Установка
+### Quick Start
 
 ```bash
-git clone https://github.com/gamerus9/Shui-Wifi-Manager
-cd Shui-Wifi-Manager
-```
-
-Явный шаг установки не нужен — зависимости объявлены inline и управляются через `uv`.
-
-## Запуск
-
-```bash
+git clone https://github.com/gamerus9/GhostPrint
+cd GhostPrint
 ./run.sh
 ```
 
-Или напрямую:
+Or run directly:
 
 ```bash
 uv run app.py
 ```
 
-Или через системный Python (предварительно установить зависимости):
+Or with pip:
 
 ```bash
 pip install Pillow requests tkinterdnd2
 python app.py
 ```
 
-## Настройки
+---
 
-При первом запуске рядом с `app.py` создаётся `settings.json`. Его можно редактировать вручную или через диалог настроек (кнопка ⚙):
+## Configuration
 
-| Параметр | По умолчанию | Описание |
+On first launch, `settings.json` is created next to `app.py`.
+Edit it manually or via the ⚙ settings dialog:
+
+| Parameter | Default | Description |
 |---|---|---|
-| `printer_ip` | `192.168.1.213` | IP-адрес принтера |
-| `upload_speed_kbs` | `80` | Используется для оценки времени загрузки |
-| `default_cooling` | `0` | Охлаждение по умолчанию в диалоге отправки (секунды) |
-| `projects_dir` | `projects` | Папка, в которой ищутся `.gcode` файлы |
+| `printer_ip` | `192.168.1.213` | Printer IP address |
+| `upload_speed_kbs` | `80` | Used for upload time estimation |
+| `default_cooling` | `0` | Default cooling pause in seconds |
+| `projects_dir` | `projects` | Folder scanned for `.gcode` files |
 
-## Как это работает
+---
 
-Прошивка SHUI/Marlin предоставляет:
-- **TCP порт 8080** — текстовый интерфейс команд Marlin (M105 температуры, M27 состояние печати)
-- **HTTP `/upload`** — эндпоинт для загрузки файлов (multipart)
+## How It Works
 
-Приложение подключается по TCP для опроса статуса каждые 15 секунд и загружает G-code по HTTP. G-code формирует слайсер — приложение только опционально добавляет блок охлаждения перед `M84`.
+SHUI firmware on the ESP8266 WiFi module exposes two interfaces:
 
-## Совместимость
+| Interface | Protocol | Used for |
+|---|---|---|
+| TCP port 8080 | Plain-text Marlin | Status polling (M105 temps, M27 progress), terminal commands |
+| HTTP `/upload` | multipart/form-data | G-code file transfer |
 
-Проверено с:
-- Flying Bear Ghost 5 (прошивка SHUI)
-- OrcaSlicer, UltiMaker Cura, PrusaSlicer
+GhostPrint polls the printer every 15 seconds over TCP and uploads G-code over HTTP.
+The app never modifies your G-code — it only optionally appends a cooling block before `M84`.
 
-Должно работать с любым принтером на прошивке SHUI/Marlin с аналогичным TCP/HTTP интерфейсом.
+---
 
-## Лицензия
+## Platform Notes
 
-MIT
+| Platform | Status |
+|---|---|
+| macOS | ✅ Full support |
+| Windows | ✅ Core features work |
+| Linux | ✅ Core features work |
+
+"Open in Finder" and "Open in OrcaSlicer" context menu items use macOS `open` command and won't work on Windows/Linux.
+
+---
+
+## Development
+
+```bash
+# Run tests
+uv run --with pytest --no-project pytest tests/ -v
+```
+
+---
+
+## Keywords
+
+Flying Bear Ghost 5 WiFi · Flying Bear Reborn · MKS WiFi manager · SHUI firmware ·
+Marlin WiFi print manager · gcode sender WiFi · MKS Robin Nano · ESP8266 3D printer ·
+Flying Bear print software · WiFi 3D printing desktop app
+
+---
+
+## На русском
+
+**GhostPrint** — десктопное приложение для отправки G-code файлов и мониторинга 3D-принтера по WiFi.
+
+Разработано и проверено на **Flying Bear Ghost 5 / Reborn**. Должно работать на любом принтере с модулем **MKS WiFi (ESP8266)** на прошивке **SHUI** — но из-за отсутствия другого железа не проверялось.
+
+**Возможности:** отправка файлов по WiFi · прогресс-бар печати · мониторинг температур · управление печатью (пауза/стоп) · G-code терминал · браузер проектов · превью миниатюр · drag & drop · история отправок
+
+**Запуск:**
+```bash
+git clone https://github.com/gamerus9/GhostPrint
+cd GhostPrint
+uv run app.py
+```
+
+---
+
+## License
+
+MIT © 2025
