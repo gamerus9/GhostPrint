@@ -7,7 +7,7 @@
 #   "tkinterdnd2>=0.3.0",
 # ]
 # ///
-"""SHUI Print Manager — управление 3D-печатью для принтеров на прошивке SHUI."""
+"""GhostPrint — управление 3D-печатью для принтеров на прошивке SHUI/Marlin."""
 
 import base64
 import io
@@ -299,12 +299,25 @@ def _recv_line(s: socket.socket, timeout: float = 3.0) -> str:
 
 
 def _drain_banner(s: socket.socket):
-    """Consume the SHUI welcome banner sent on every new connection."""
+    """Consume the SHUI welcome banner sent on every new connection.
+
+    Banner arrives as 'Welcome to SHUI wifi module\\n'. During printing it may
+    come in multiple TCP packets, so we accumulate until we see '\\n'.
+    We stop after the banner line — waiting for a full 2 s timeout is wasteful
+    and risks the connection being recycled before M105 can be sent.
+    """
     s.settimeout(1.0)
-    try:
-        s.recv(512)
-    except (socket.timeout, OSError):
-        pass
+    buf = bytearray()
+    while True:
+        try:
+            chunk = s.recv(512)
+            if not chunk:
+                break
+            buf.extend(chunk)
+            if b'\n' in buf:
+                break          # banner line complete
+        except (socket.timeout, OSError):
+            break
 
 
 def _tcp_command(ip: str, cmd: str, timeout: float = 3.0) -> str:
@@ -417,12 +430,29 @@ def _query_printer_status(ip: str, timeout: float = 12.0, retries: int = 2) -> d
                     # M27 — print progress (same open connection, no reconnect needed)
                     s.sendall(b"M27\r\n")
                     r27 = _recv_line(s, timeout)
+                    # Some firmware versions (or leftover M105 bytes) can produce an
+                    # "ok" acknowledgment line before the actual M27 state response.
+                    # If the first line doesn't contain recognisable M27 content,
+                    # try reading one more line.
+                    if not re.search(r'SD printing|Not SD printing|paused',
+                                     r27, re.IGNORECASE):
+                        extra = _recv_line(s, 2.0)
+                        if extra.strip():
+                            r27 = extra
                     pm = re.search(r'SD printing byte (\d+)/(\d+)', r27)
+
+                    if pm:
+                        state = "PRINTING"
+                    elif re.search(r'paused', r27, re.IGNORECASE):
+                        state = "PAUSED"
+                    else:
+                        state = "IDLE"
 
                     return {
                         "hotend":   (float(m.group(1)), float(m.group(2))),
                         "bed":      (float(m.group(3)), float(m.group(4))),
                         "progress": (int(pm.group(1)), int(pm.group(2))) if pm else None,
+                        "state":    state,
                     }
             except (socket.timeout, OSError) as e:
                 if attempt < retries - 1:
@@ -1236,7 +1266,7 @@ class ProjectCard(tk.Frame):
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("SHUI Print Manager")
+        self.title("GhostPrint")
         self.geometry("980x700")
         self.minsize(720, 520)
         self.configure(bg=BG)
@@ -1276,10 +1306,10 @@ class App(tk.Tk):
         hdr.pack_propagate(False)
 
         # Left: logo
-        tk.Label(hdr, text="SHUI",
+        tk.Label(hdr, text="Ghost",
                  bg=BG_HDR, fg=FG,
                  font=("Helvetica", 14, "bold")).pack(side=tk.LEFT, padx=(20, 4))
-        tk.Label(hdr, text="Print Manager",
+        tk.Label(hdr, text="Print",
                  bg=BG_HDR, fg=FG2,
                  font=("Helvetica", 14)).pack(side=tk.LEFT)
 
@@ -1643,8 +1673,11 @@ class App(tk.Tk):
             b_cur, b_tgt = status["bed"]
             prog  = status["progress"]
 
-            # Derive state: M27 bytes present → likely PRINTING; check for PAUSED too
-            state = get_printer_state(ip) or ("PRINTING" if (prog and prog[1] > 0) else "IDLE")
+            state = status["state"]
+            # Fallback: progress bytes present ⇒ printer is printing even if M27
+            # state parsing was confused by a stray "ok" line in the socket buffer.
+            if state == "IDLE" and prog and prog[1] > 0:
+                state = "PRINTING"
 
             temp_str = f"T:{t_cur:.0f}°/{t_tgt:.0f}°  B:{b_cur:.0f}°/{b_tgt:.0f}°"
 

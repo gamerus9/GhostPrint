@@ -1,0 +1,35 @@
+# Tests
+tests/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+
+# App data (user-specific, not for repo)
+settings.json
+history.json
+app_debug.log
+
+# G-code projects (large binary-ish files, user content)
+projects/*
+!projects/.gitkeep
+*.gcode
+
+# Claude Code
+CLAUDE.md
+
+# Obsidian
+.obsidian/
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*.swo
